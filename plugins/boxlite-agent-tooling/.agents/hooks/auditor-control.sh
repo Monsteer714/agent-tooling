@@ -313,7 +313,12 @@ auditor_control_preserve_active_completion_receipts() {
 }
 
 auditor_control_close_scope_state() {  # terminal, retires active records and closes open escalations
-  local terminal="$1" path json generation auditor escalation_state
+  local terminal="$1" path json generation auditor escalation_state closed_at now max_age
+  now="$(date +%s)"
+  # A closed escalation still authenticates a late SubagentStop for the auditor's
+  # lifetime; past that, retiring it keeps each prompt's scan within the lock budget.
+  # shellcheck disable=SC2154
+  max_age="$((verdict_audit_lock_max_seconds + verdict_audit_deadline_slack_seconds))"
   auditor_control_preserve_active_completion_receipts || return 1
   for path in "$auditor_control_state_dir"/escalation."$scope".*.json; do
     [[ -e "$path" || -L "$path" ]] || continue
@@ -329,7 +334,14 @@ auditor_control_close_scope_state() {  # terminal, retires active records and cl
       continue
     fi
     escalation_state="$(printf '%s' "$json" | jq -r '.state // ""')"
-    [[ "$escalation_state" == open ]] || continue
+    if [[ "$escalation_state" == closed ]]; then
+      closed_at="$(printf '%s' "$json" | jq -r '.closed_at // ""')"
+      if [[ ! "$closed_at" =~ ^[1-9][0-9]*$ || ${#closed_at} -gt 18 ]] \
+         || (( closed_at > now || now > closed_at + max_age )); then
+        auditor_control_state_retire_cache_entry "$path" || return 1
+      fi
+      continue
+    fi
     printf '%s' "$json" | jq -c --arg terminal "$terminal" --argjson now "$(date +%s)" \
       '.state="closed" | .terminal=$terminal | .closed_at=$now' \
       | auditor_control_write_json_atomic "$path" || continue

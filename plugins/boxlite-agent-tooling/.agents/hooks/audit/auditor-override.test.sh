@@ -601,5 +601,35 @@ else
 fi
 
 rm -rf "$R"
+
+echo "## A new prompt retires expired closed escalations"
+R="$(setup)"
+scope="$(scope_of "$R" closed-retention)"
+control_dir="$R/.agents/state/auditor-control"
+mkdir -p "$control_dir"
+now="$(date +%s)"
+write_escalation() {  # generation, state, opened_at, closed_at
+  jq -nc --arg g "$1" --arg s "$scope" --arg state "$2" \
+    --argjson opened "$3" --argjson closed "$4" \
+    '{auditor:"verdict-auditor",generation:$g,session_scope:$s,prompt_epoch:"101-102-3",
+      state:$state,opened_at:$opened}
+     + (if $closed > 0 then {closed_at:$closed,terminal:"new-prompt"} else {} end)' \
+    > "$control_dir/escalation.$scope.verdict-auditor.$1.json"
+}
+for i in 1 2 3; do
+  write_escalation "expired-$i" closed "$((now - 7300))" "$((now - 7200))"
+done
+write_escalation recent closed "$((now - 120))" "$((now - 60))"
+write_escalation open-now open "$((now - 30))" 0
+retention_rc=0
+handle_prompt "$R" "$(jq -nc '{hook_event_name:"UserPromptSubmit",session_id:"closed-retention",prompt:"next"}')" \
+  101-102-3 103-104-5 >/dev/null 2>"$R/retention.err" || retention_rc=$?
+remaining="$(cd "$control_dir" && for f in escalation."$scope".*.json; do
+  [[ -e "$f" ]] && jq -r '"\(.generation)=\(.state)"' "$f"; done | sort | tr '\n' ' ')"
+check_eq "expired closed escalations are retired; recent and just-closed ones remain" \
+  "rc=$retention_rc remaining=$remaining stderr=$(cat "$R/retention.err")" \
+  "rc=0 remaining=open-now=closed recent=closed  stderr="
+rm -rf "$R"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
