@@ -2,6 +2,8 @@
 # Exercise the three public gates with the same untrusted Markdown.
 # Usage: tldr-gates.test.sh [fast]. The full matrix takes minutes; `fast` keeps the
 # library denial checks and the all-gates `missing` case, under a minute.
+# TLDR_GATES_CASES=a,b runs only those all-gates cases, plus the library checks; a
+# label that runs no case fails the suite.
 # shellcheck disable=SC2016 # Markdown backticks in expected feedback are literal.
 set -euo pipefail
 plugin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -19,7 +21,7 @@ SH
 chmod +x "$scratch/bin/gh"
 export PATH="$scratch/bin:$PATH" VERDICT_CLASSIFIER_CMD=false
 cd "$scratch/repo"
-pass=0 fail=0 mode="${1:-full}"
+pass=0 fail=0 mode="${1:-full}" ran_cases=,
 run_hook() { # host, event, script basename; stdin is the native hook payload
   local host="$1" manifest="$plugin/hooks/hooks.json" root=CLAUDE_PLUGIN_ROOT command
   if [[ "$host" == codex ]]; then
@@ -37,6 +39,8 @@ check() { # label, text, expected allow|deny, optional reply/design expectation,
   local label="$1" body="$2" expected="$3" reply_expected="${4:-$3}" reason="${5:-TL;DR}"
   local output actual gate active wanted host mentions
   [[ "$mode" != fast || "$label" == missing ]] || return 0
+  [[ -z "${TLDR_GATES_CASES:-}" || ",$TLDR_GATES_CASES," == *",$label,"* ]] || return 0
+  ran_cases+="$label,"
   for gate in github-claude github-codex github-codex-native design stop-claude stop-codex stop-transcript-claude stop-transcript-codex; do
     host=claude
     [[ "$gate" != *codex* ]] || host=codex
@@ -88,6 +92,10 @@ check visible_alert 'PR #141 needs review.' deny deny 'TL;DR heading missing'
 check bold_label '**TL;DR:** A concise answer.' deny deny '`## TL;DR`, one short sentence'
 check empty $'## TL;DR\n\n## Details\nA concise answer.' deny deny 'summary missing or invalid'
 check symbol_start $'## TL;DR\n\n#120 is ready.' deny deny 'summary missing or invalid'
+# Inline code may open the sentence; a list or setext heading is no sentence (#257).
+check code_start $'## TL;DR\n\n`stop-gate.sh` now leads every reply with a summary.' allow
+check list_start $'## TL;DR\n\n* A concise answer.' deny deny 'summary missing or invalid'
+check setext_start $'## TL;DR\n\nA concise answer.\n===' deny deny 'summary missing or invalid'
 check fenced $'```markdown\n## TL;DR\nA concise answer.\n```' deny deny 'TL;DR heading missing'
 check quoted $'> ## TL;DR\n> A concise answer.' deny deny 'TL;DR heading missing'
 check commented $'<!--\n## TL;DR\nA concise answer.\n-->' deny deny 'TL;DR heading missing'
@@ -159,5 +167,14 @@ facade_failure missing 'start with `## TL;DR`' 'A concise answer.' '' yes
 facade_failure not_first 'TL;DR not first' $'Details first.\n\n## TL;DR\n\nA concise answer.' '' yes
 facade_failure bad_summary 'summary missing or invalid' $'## TL;DR\n\n#120 is ready.' '' yes
 facade_failure too_long 'has 44 words (limit 39)' $'## TL;DR\n\nRetry failed requests once.\n\n'"$details" '' yes
+# A mistyped filter label must not pass on the library checks alone.
+if [[ -n "${TLDR_GATES_CASES:-}" ]]; then
+  IFS=, read -ra wanted_cases <<< "$TLDR_GATES_CASES"
+  for wanted in "${wanted_cases[@]}"; do
+    [[ "$ran_cases" == *",$wanted,"* ]] && continue
+    printf 'FAIL TLDR_GATES_CASES label ran no case: %s\n' "$wanted"
+    fail=$((fail+1))
+  done
+fi
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" == 0 ]]
