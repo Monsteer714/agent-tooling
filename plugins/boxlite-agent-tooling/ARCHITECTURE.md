@@ -124,6 +124,8 @@ failures block publication. Hidden source URLs do not count as links. Direct API
 and browser PR writes remain outside this CLI check. Structural failures leave
 the author-review acknowledgment untouched. Other peer-review artifacts follow the shared writing
 rule; their classification and explanation accuracy remain review responsibilities.
+PR authoring follows the [instruction owners](CONTRIBUTING.md#instruction-ownership).
+The structural checker does not judge example relevance or accuracy.
 
 ### GitHub writing
 
@@ -337,8 +339,11 @@ Sources: [question timeout](https://code.claude.com/docs/en/tools-reference#ques
 PR prompts are runtime-loaded through `subagent_prompt`: `.agents/prompts/pr/pr-review-question.md`
 supplies the shared explanation check, `.agents/prompts/pr/pr-review-ack.md` supplies both
 normal and bounded local acknowledgment instructions, `.agents/prompts/pr/pr-description-guidance.md`
-names the `boxlite-writing` skill alongside PR-specific guidance, and `.agents/prompts/pr/pr-author-review.md` supplies the
-GitHub comment. Missing, empty, or unrenderable prompts fail closed before consuming
+directs authors to read and apply `boxlite-pr-preparation` and `boxlite-writing`, and
+`.agents/prompts/pr/pr-author-review.md` supplies the GitHub comment. The renderer
+substitutes placeholders; it does not
+inline linked Markdown. Entry points explicitly instruct agents to load required
+guidance. Missing, empty, or unrenderable prompts fail closed before consuming
 a local acknowledgment or publishing GitHub acknowledgment success. A local recovery
 prompt over 1200 bytes also fails closed. No embedded fallback copy is kept in Bash.
 Writing denials deliver the checker diagnostic and skill reference directly;
@@ -483,9 +488,10 @@ GitHub events run `.github/workflows/author-review.yml` from trusted base/defaul
 code. `scripts/pr-author-review.sh` checks dependencies and calls the single facade
 `pr_author_review_run` in `.agents/lib/pr-author-review.sh`. This gate is independent of
 all local hooks above.
-The PR template, authoring guidance, and both review prompts direct authors and
-reviewers to apply `boxlite-writing` to the description, including drafts
-and revisions. The review question also checks How it works against the diff.
+The local PR hook and GitHub author review load the same [review question](.agents/prompts/pr/pr-review-question.md).
+It applies `boxlite-writing` and asks whether the explanation fits the current diff.
+The preparation skill uses that question for its self-check; self-review cannot
+supply the human's acknowledgment.
 Acknowledgment remains bound to the commit SHA and does not certify description quality
 or expire on body edits.
 
@@ -808,7 +814,7 @@ hooks/                  the twin host hook manifests
 .agents/lib/            shared state, receipt, host, wake and rendering libraries; sourced, never run
 .agents/prompts/        editable Markdown prompt templates, read when a request is built
 .agents/watch/          the pr-watch producer and its stream and attach consumers
-.agents/skills/         boxlite-design-doc, boxlite-clean-code, shell-engineering, boxlite-visualize, boxlite-examples, adversarial-iteration, boxlite-writing
+.agents/skills/         boxlite-design-doc, boxlite-clean-code, boxlite-pr-preparation, shell-engineering, boxlite-visualize, boxlite-examples, adversarial-iteration, boxlite-writing
 .claude/agents/         the two auditor specs
 .githooks/              the universal Git gates
 scripts/                profile validation, installation verify/sync/refresh, setup, guidance splice, unattended-run supervisor, author review acknowledgment
@@ -845,3 +851,12 @@ for text selection.
 `boxlite-design-doc` owns research requirements, the design outline, and design review.
 Hosts discover it through the same `skills/` alias; consumers name the skill without
 copying its rules. The full Test section and reproduce-before-fix remain in workflow guidance.
+
+`boxlite-pr-preparation` keeps four steps in one entrypoint: inspect inputs, choose
+an illustration, write the description, and verify delivery. Input, illustration,
+and description tables support those steps. The short selection table is core
+guidance used for every description, so it stays inline. The skill explicitly reads
+the shared workflow and repository instructions, then loads contributor procedures
+for authorized publication. The [ownership table](CONTRIBUTING.md#instruction-ownership)
+identifies policy, outline, checker, and review owners. Skill invocation grants no
+publication or approval authority.
