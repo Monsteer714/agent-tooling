@@ -66,6 +66,22 @@ install with the real CLI in an empty isolated Codex home. Verify fresh
 `skills/list` and `hooks/list` results against shipped assets; repeat after
 reinstall without editing the installed cache.
 
+### Transcript discovery for verdict audits
+
+Version 0.1.36 makes auditors discover the full parent transcript from session identity,
+host, repository, and request time. [boxlite-verdict-audit](.agents/skills/boxlite-verdict-audit/SKILL.md)
+owns discovery and the entire audit procedure; the agent definition remains a thin adapter.
+Known hosts have storage hints; unknown hosts investigate available tools and metadata.
+The auditor verifies parent identity and a stable read boundary before certifying claims.
+
+Triage and history keep bounded summaries. The runner's first argument is bookkeeping
+only; use `-` when unavailable. No transcript path reaches the auditor task. For example,
+an auditor given a session ID must reject a newer transcript belonging to another session.
+`full-transcript.test.sh` covers this handoff and complete evidence access through stubs;
+independent skill evaluations are needed to check model behavior. Run the suite with
+`make test:plugin TEST_FILTER=full-transcript`.
+Reload the plugin or start a new task after adoption.
+
 ### PR-size choice rollout
 
 Version 0.1.29 packages the **Bypass limit** / **Split PR** flow. Verify both adopted

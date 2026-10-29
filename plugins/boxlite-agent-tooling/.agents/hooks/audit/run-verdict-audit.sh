@@ -3,13 +3,15 @@
 # INDEPENDENT auditor — the same cold-reader judgment Claude Code gets from its
 # verdict-auditor subagent — instead of degrading to self-audit.
 #
-#   bash .agents/hooks/audit/run-verdict-audit.sh <transcript_path> [session_id] [generation] [session_scope]
+#   bash .agents/hooks/audit/run-verdict-audit.sh <bookkeeping_path|-> [session_id] [generation] [session_scope]
 #
-# Feeds the procedure in .claude/agents/verdict-auditor.md (frontmatter stripped)
+# Feeds boxlite-verdict-audit with the thin verdict-auditor launch adapter
 # as the system prompt to a model CLI with Read/Bash/Write tools, which audits the
 # transcript's final turn (all assistant text since the last real user message,
 # mid-turn claims included) against the working tree and writes the
 # requested session-scoped dossier under .agents/state/. Succeeds only if it lands.
+# The source argument supplies bounded history only; the auditor discovers its own
+# transcript from parent context. Use - when no bookkeeping source is available.
 #
 # Model resolution (same seam pattern as the triage classifier):
 #   1. VERDICT_AUDITOR_CMD — full override; invoked with the audit prompt on stdin;
@@ -28,14 +30,15 @@
 #             130 canceled by a newer user prompt/INT · 143 canceled by TERM.
 set -uo pipefail
 
-transcript_path="${1:-}"
-if [[ -z "$transcript_path" ]]; then
-  echo "usage: run-verdict-audit.sh <transcript_path> [session_id] [generation]" >&2
+bookkeeping_source="${1:-}"
+if [[ -z "$bookkeeping_source" ]]; then
+  echo "usage: run-verdict-audit.sh <bookkeeping_path|-> [session_id] [generation]" >&2
   exit 2
 fi
 session_id="${2:-}"
 audit_generation="${3:-}"
 provided_session_scope="${4:-}"
+audit_started_at="$(date +%s)"
 
 project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
 repo_root="$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null \
@@ -66,8 +69,8 @@ quarantine_counter=0
 audit_verified_file=""
 audit_verified_identity=""
 audit_success_pending=false
-transcript_snapshot_dir=""
-transcript_snapshot_path=""
+history_snapshot_dir=""
+history_snapshot_path=""
 transcript_turn_max_bytes=262144
 previous_dossier_max_bytes=65536
 previous_dossier_input_path=""
@@ -397,13 +400,13 @@ cleanup_audit_lock() {
     audit_reflection_gate "$reflection_context" "$reflection_terminal" "$audit_token" \
       "\"verdict runner exited with status $original_status\"" >/dev/null || true
   fi
-  if [[ -n "$transcript_snapshot_path" ]]; then
-    rm -f "$transcript_snapshot_path" 2>/dev/null || true
-    transcript_snapshot_path=""
+  if [[ -n "$history_snapshot_path" ]]; then
+    rm -f "$history_snapshot_path" 2>/dev/null || true
+    history_snapshot_path=""
   fi
-  if [[ -n "$transcript_snapshot_dir" ]]; then
-    rmdir "$transcript_snapshot_dir" 2>/dev/null || true
-    transcript_snapshot_dir=""
+  if [[ -n "$history_snapshot_dir" ]]; then
+    rmdir "$history_snapshot_dir" 2>/dev/null || true
+    history_snapshot_dir=""
   fi
   if [[ -n "$previous_dossier_snapshot_path" ]]; then
     rm -f "$previous_dossier_snapshot_path" 2>/dev/null || true
@@ -723,20 +726,23 @@ request_cancel() {  # exit-code reason [publish-tombstone]
   cancel_audit "$1" "$2" "${3:-false}"
 }
 
-# Select one stable regular transcript inode and give the auditor a private bounded
-# snapshot. This keeps a live transcript append, pathname swap, FIFO, or symlink from
-# changing what the prompt names after the boundary check.
-snapshot_transcript() {
+# Keep history bounded. Evidence discovery and its read boundary belong to the skill.
+snapshot_history() {
   local created_snapshot_dir selected_snapshot selected_json normalized_snapshot
   local normalized_bytes
   created_snapshot_dir="$(mktemp -d \
-    "${TMPDIR:-/tmp}/boxlite-verdict-transcript.XXXXXX" 2>/dev/null)" || return 1
-  transcript_snapshot_dir="$created_snapshot_dir"
-  chmod 700 "$transcript_snapshot_dir" 2>/dev/null || return 1
-  transcript_snapshot_dir="$(cd "$transcript_snapshot_dir" && pwd -P)" || return 1
-  transcript_snapshot_path="$transcript_snapshot_dir/transcript.jsonl"
+    "${TMPDIR:-/tmp}/boxlite-verdict-history.XXXXXX" 2>/dev/null)" || return 1
+  history_snapshot_dir="$created_snapshot_dir"
+  chmod 700 "$history_snapshot_dir" 2>/dev/null || return 1
+  history_snapshot_dir="$(cd "$history_snapshot_dir" && pwd -P)" || return 1
+  history_snapshot_path="$history_snapshot_dir/history.json"
+  if [[ "$bookkeeping_source" == - ]]; then
+    verdict_audit_failed_turn_snapshot "$transcript_turn_max_bytes" \
+      | verdict_audit_write_exclusive_regular "$history_snapshot_path"
+    return $?
+  fi
   selected_snapshot="$(verdict_audit_read_regular_state \
-    "$transcript_path" "$transcript_turn_max_bytes" json 2>/dev/null)" \
+    "$bookkeeping_source" "$transcript_turn_max_bytes" json 2>/dev/null)" \
     || selected_snapshot=""
   selected_json=""
   [[ "$selected_snapshot" == *$'\n'* ]] \
@@ -751,17 +757,16 @@ snapshot_transcript() {
        || "$normalized_bytes" -gt "$transcript_turn_max_bytes" ]] \
        || ! printf '%s\n' "$normalized_snapshot" \
             | verdict_audit_write_exclusive_regular \
-                "$transcript_snapshot_path" 2>/dev/null; then
+                "$history_snapshot_path" 2>/dev/null; then
       return 1
     fi
   elif ! verdict_audit_snapshot_final_turn \
-        "$transcript_path" "$transcript_snapshot_path" \
+        "$bookkeeping_source" "$history_snapshot_path" \
         "$verdict_audit_final_turn_max_bytes" "$transcript_turn_max_bytes"; then
     printf 'run-verdict-audit.sh: transcript must be stable, regular JSONL whose final turn is at most %s bytes; auditor was not started.\n' \
       "$verdict_audit_final_turn_max_bytes" >&2
     return 1
   fi
-  transcript_path="$transcript_snapshot_path"
 }
 
 snapshot_previous_dossier() {
@@ -850,7 +855,7 @@ if ! audit_request_is_current; then
   cancel_audit 130 "the audit generation was revoked before launch"
 fi
 snapshot_retry_dossier
-if ! snapshot_transcript; then
+if ! snapshot_history; then
   exit 2
 fi
 if ! snapshot_previous_dossier; then
@@ -934,7 +939,7 @@ if [[ "$session_scope" != "-" ]]; then
     '{repo_root:$root,session:$session,epoch:$epoch,branch:$branch,gate:"verdict"}')" || exit 2
   history_tree="$(compute_audit_tree_hash)" || exit 2
   history_input="$(jq -nc --arg branch "$expected_branch" --arg head "$expected_head" \
-    --arg tree "$history_tree" --arg generation "$audit_generation" --slurpfile turn "$transcript_path" \
+    --arg tree "$history_tree" --arg generation "$audit_generation" --slurpfile turn "$history_snapshot_path" \
     '{binding:{branch:$branch,head:$head,tree_hash:$tree,generation:$generation},
       snapshot:{transcript:$turn,tree:$tree}}')" || exit 2
   history_request="$(audit_reflection_gate "$reflection_context" prepare "$audit_token" "$history_input")" || exit 2
@@ -943,13 +948,16 @@ if [[ "$session_scope" != "-" ]]; then
 fi
 task_input_json="$(jq -nc \
   --arg repo_root "$repo_root" \
-  --arg transcript_path "$transcript_path" \
+  --arg parent_session_id "$session_id" \
+  --arg parent_host "$audit_host" \
+  --arg audit_started_at "$audit_started_at" \
   --arg dossier_path "$audit_output_file" \
   --arg previous_dossier_path "$previous_dossier_input_path" \
   --arg audit_generation "$audit_generation" \
   --arg expected_branch "$expected_branch" \
   --arg expected_head "$expected_head" \
-  '{repo_root:$repo_root, transcript_path:$transcript_path,
+  '{repo_root:$repo_root, parent_session_id:$parent_session_id,
+    parent_host:$parent_host, audit_started_at:$audit_started_at,
     dossier_path:$dossier_path, previous_dossier_path:$previous_dossier_path,
     audit_generation:$audit_generation, expected_branch:$expected_branch,
     expected_head:$expected_head}')"
@@ -1164,13 +1172,19 @@ fail_audit_publication() {  # diagnostic
 
 export VERDICT_AUDITOR_OUTPUT_FILE="$audit_output_file"
 export VERDICT_AUDITOR_GENERATION="$audit_generation"
-if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
-  if [[ ! -r "$spec_file" ]]; then
+audit_skill="$tooling_root/.agents/skills/boxlite-verdict-audit/SKILL.md"
+transcript_guide="${audit_skill%/*}/references/transcripts.md"
+for instruction_file in "$spec_file" "$audit_skill" "$transcript_guide"; do
+  if [[ ! -r "$instruction_file" ]]; then
     printf 'run-verdict-audit.sh: missing %s — cannot load the audit procedure.\n' \
-      "$spec_file" >&2
+      "$instruction_file" >&2
     exit 2
   fi
-  spec_body="$(strip_frontmatter "$spec_file")"
+done
+# Headless prompts have no source-file location for relative skill references.
+spec_body="Audit skill location JSON: $(jq -nc --arg path "$audit_skill" '{path:$path}')"
+spec_body+=$'\n\n'"$(strip_frontmatter "$spec_file")"$'\n\n'"$(strip_frontmatter "$audit_skill")"
+if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
   # The stable procedure comes first so repeated headless audits can reuse that prefix;
   # only the bounded runner task and its JSON input vary by generation.
   audit_prompt="${spec_body}"$'\n\n'"${audit_prompt}"
@@ -1190,7 +1204,6 @@ elif [[ "$audit_host" != codex ]] && command -v claude >/dev/null 2>&1 && [[ -r 
   audit_started=true
   remove_owned_verdict
   rm -f "$audit_output_file"
-  spec_body="$(strip_frontmatter "$spec_file")"
   # Safe mode retains OAuth/keychain auth while dropping project/plugin/memory/hook
   # context. Replace the coding-agent prompt with the stripped auditor procedure and
   # expose its audit and timer tools; --name suppresses a separate title request.
@@ -1210,7 +1223,6 @@ elif [[ "$audit_host" != claude ]] && codex_bin="$(codex_cli_find)" && [[ -r "$s
   audit_started=true
   remove_owned_verdict
   rm -f "$audit_output_file"
-  spec_body="$(strip_frontmatter "$spec_file")"
   if ! codex_tree_hash="$(compute_audit_tree_hash)"; then
     remove_owned_verdict while-current
     printf 'run-verdict-audit.sh: could not capture the working-tree hash for the read-only Codex auditor.\n' >&2
@@ -1241,7 +1253,7 @@ else
 Set VERDICT_AUDITOR_CMD (stdin = audit prompt; it must write the requested dossier path)
 or install the current host's CLI (Claude or Codex for unknown callers).
 As a last resort, execute the procedure in
-.claude/agents/verdict-auditor.md with any capable model and have IT write the dossier.
+.agents/skills/boxlite-verdict-audit/SKILL.md with any capable model and have IT write the dossier.
 EOF
   exit 2
 fi
