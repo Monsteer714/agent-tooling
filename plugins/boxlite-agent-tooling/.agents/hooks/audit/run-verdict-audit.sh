@@ -80,6 +80,11 @@ retry_dossier_json=""
 reflection_context=""
 reflection_pending=false
 history_path=""
+audit_route=setup
+audit_process_status=null
+audit_stderr_dir=""
+audit_stderr_file=""
+audit_stderr_pid=0
 
 audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
 if [[ ! -r "$audit_state_lib" ]]; then
@@ -89,6 +94,13 @@ if [[ ! -r "$audit_state_lib" ]]; then
 fi
 # shellcheck source=../../lib/verdict-audit-state.sh
 source "$audit_state_lib"
+# shellcheck source=../../lib/audit-request.sh
+source "$tooling_root/.agents/lib/audit-request.sh" || exit 2
+# shellcheck source=../../lib/audit-network.sh
+source "$tooling_root/.agents/lib/audit-network.sh" || exit 2
+audit_network_load || exit 2
+# shellcheck source=../../lib/audit-diagnostics.sh
+source "$tooling_root/.agents/lib/audit-diagnostics.sh" || exit 2
 # shellcheck source=../../lib/audit-reflection.sh
 source "$tooling_root/.agents/lib/audit-reflection.sh"
 # shellcheck source=../../lib/audit-reflection-gate.sh
@@ -398,7 +410,9 @@ cleanup_audit_lock() {
     local reflection_terminal=error
     (( original_status == 130 || original_status == 143 )) && reflection_terminal=cancel
     audit_reflection_gate "$reflection_context" "$reflection_terminal" "$audit_token" \
-      "\"verdict runner exited with status $original_status\"" >/dev/null || true
+      "$(jq -nc --arg route "$audit_route" --argjson status "$original_status" \
+        --argjson process "$audit_process_status" --argjson elapsed "$(( $(date +%s) - audit_started_at ))" \
+        '{route:$route,runner_exit:$status,process_exit:$process,elapsed_seconds:$elapsed}')" >/dev/null || true
   fi
   if [[ -n "$history_snapshot_path" ]]; then
     rm -f "$history_snapshot_path" 2>/dev/null || true
@@ -436,8 +450,10 @@ cleanup_audit_lock() {
       retire_matching_session_verdict
       printf 'run-verdict-audit.sh: could not close auditor prompt state.\n' >&2
       trap - EXIT
+      finish_audit_diagnostic 2
       exit 2
     fi
+    finish_audit_diagnostic "$original_status"
     return 0
   fi
   if body="$(verdict_audit_read_single_record "$audit_lock_file" 2>/dev/null)"; then
@@ -461,6 +477,7 @@ cleanup_audit_lock() {
     printf 'run-verdict-audit.sh: cancelled — the audit ownership lease was lost before success\n' \
       >&2
     trap - EXIT
+    finish_audit_diagnostic 143
     exit 143
   fi
   if [[ "$control_cleanup_failed" == true ]]; then
@@ -471,6 +488,7 @@ cleanup_audit_lock() {
     retire_matching_session_verdict
     printf 'run-verdict-audit.sh: could not close auditor prompt state.\n' >&2
     trap - EXIT
+    finish_audit_diagnostic 2
     exit 2
   fi
   if (( original_status == 0 )); then
@@ -483,6 +501,7 @@ cleanup_audit_lock() {
       printf 'run-verdict-audit.sh: cancelled — the audit generation was revoked before lease commit\n' \
         >&2
       trap - EXIT
+      finish_audit_diagnostic 130
       exit 130
     fi
     # Publication is committed only after the holder returned `clean` and both direct
@@ -496,6 +515,21 @@ cleanup_audit_lock() {
     fi
     stop_request_monitor
   fi
+  finish_audit_diagnostic "$original_status"
+}
+
+# shellcheck disable=SC2329 # Called by EXIT cleanup and its failure branches.
+finish_audit_diagnostic() {
+  local status="$1" outcome=ERROR
+  exec 4>&-
+  if (( audit_stderr_pid > 0 )); then wait "$audit_stderr_pid" 2>/dev/null || true; fi
+  if (( status == 130 || status == 143 )); then outcome=CANCELED
+  elif (( status == 0 )); then outcome="${audit_verdict:-ERROR}"; fi
+  audit_diagnostic_record "$project_dir" "$session_scope" verdict "$audit_generation" \
+    "$audit_token" "$audit_route" "$audit_started_at" "$audit_process_status" "$status" \
+    "$outcome" "$audit_stderr_file" || true
+  [[ -z "$audit_stderr_file" ]] || rm -f "$audit_stderr_file"
+  [[ -z "$audit_stderr_dir" ]] || rmdir "$audit_stderr_dir" 2>/dev/null || true
 }
 
 # A session-scoped runner is authorized by the request the Stop gate wrote before
@@ -865,6 +899,10 @@ fi
 if [[ "$session_scope" != "-" ]]; then
   audit_prompt_epoch="$(verdict_audit_read_single_record \
     "$prompt_epoch_file" 2>/dev/null)" || audit_prompt_epoch=""
+  if request_context="$(audit_request_context_read "$project_dir" "$session_scope" 2>/dev/null)"; then
+    audit_prompt_epoch="$(jq -r .origin_epoch <<< "$request_context")"
+    [[ "$audit_prompt_epoch" != - ]] || audit_prompt_epoch=""
+  fi
   if [[ -n "$audit_prompt_epoch" ]]; then
     [[ -r "$auditor_control" ]] || {
       printf 'run-verdict-audit.sh: auditor lifecycle control is unavailable.\n' >&2
@@ -895,17 +933,7 @@ strip_frontmatter() {  # $1 = spec file
 # launch, so the auditor can keep the whole workspace read-only without guessing the
 # dossier binding.
 compute_audit_tree_hash() {
-  local index_file tree_hash="" command_status=0
-  index_file="$(mktemp)" || return 1
-  GIT_INDEX_FILE="$index_file" git -C "$project_dir" read-tree HEAD >/dev/null 2>&1 \
-    && GIT_INDEX_FILE="$index_file" git -C "$project_dir" add -A >/dev/null 2>&1 \
-    && tree_hash="$(GIT_INDEX_FILE="$index_file" \
-         git -C "$project_dir" write-tree 2>/dev/null)" \
-    || command_status=$?
-  rm -f "$index_file"
-  (( command_status == 0 )) && [[ "$tree_hash" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] \
-    || return 1
-  printf '%s\n' "$tree_hash"
+  audit_request_tree "$project_dir"
 }
 
 # The prompt is a document, not a string literal: .agents/prompts/audit/verdict-runner.md.
@@ -1060,9 +1088,10 @@ start_audit_group_event_channel() {
     $SIG{ALRM} = sub { exit 2 };
     alarm $timeout;
     my $line = <STDIN>;
-    exit 2 unless defined($line) && $line =~ /\Adone [0-9]+\n\z/;
+    exit 125 unless defined($line) && $line =~ /\Adone ([0-9]{1,3})\n\z/ && $1 <= 255;
+    my $status=$1;
     alarm 0;
-    exit 0;
+    exit $status;
   ' "$monitor_timeout" <&8 7>&- 8<&- 9>&- &
   audit_group_event_monitor_pid=$!
   audit_group_event_write_open=true
@@ -1090,6 +1119,14 @@ publish_audit_group_completion() {  # command-status
 run_in_audit_group() {
   local command_prompt="$1" runner_pid="$$" command_status="" monitor_status=0
   shift
+  audit_stderr_dir="$(mktemp -d "${TMPDIR:-/tmp}/boxlite-audit-stderr.XXXXXX")" || return 1
+  audit_stderr_file="$audit_stderr_dir/tail"
+  chmod 700 "$audit_stderr_dir" || return 1
+  mkfifo "$audit_stderr_dir/pipe" || return 1
+  (exec 7>&-; audit_diagnostic_tail < "$audit_stderr_dir/pipe" > "$audit_stderr_file") &
+  audit_stderr_pid=$!
+  exec 4>"$audit_stderr_dir/pipe"
+  rm -f "$audit_stderr_dir/pipe"
   # Job control gives this one background sentinel a fresh process group on Bash 3,
   # available on both macOS and Linux. The sentinel runs and reaps the model pipeline,
   # publishes completion over a parent-owned unlinked FIFO, then remains alive so
@@ -1118,9 +1155,10 @@ run_in_audit_group() {
     if ! cd "$project_dir"; then
       command_status=125
     else
-      printf '%s' "$command_prompt" | "$@" 8>&- 9>&-
+      printf '%s' "$command_prompt" | "$@" 8>&- 9>&- 2>&4 4>&- >/dev/null
       command_status=$?
     fi
+    exec 4>&-
     if ! publish_audit_group_completion "$command_status"; then
       # Preserve the anchor. After exec this process is still the runner's direct child,
       # so getppid() makes the exceptional notification immune to PID reuse.
@@ -1144,6 +1182,7 @@ run_in_audit_group() {
   ) &
   audit_pgid=$!
   audit_group_identity_owned=true
+  exec 4>&-
   exec 9>&-
   audit_group_event_write_open=false
   set +m
@@ -1153,6 +1192,7 @@ run_in_audit_group() {
   fi
   start_request_monitor
   wait "$audit_group_event_monitor_pid" 2>/dev/null || monitor_status=$?
+  audit_process_status="$monitor_status"
   audit_group_event_monitor_pid=0
   if (( monitor_status != 0 )); then
     quiesce_audit_group
@@ -1185,6 +1225,7 @@ done
 spec_body="Audit skill location JSON: $(jq -nc --arg path "$audit_skill" '{path:$path}')"
 spec_body+=$'\n\n'"$(strip_frontmatter "$spec_file")"$'\n\n'"$(strip_frontmatter "$audit_skill")"
 if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
+  audit_route=override
   # The stable procedure comes first so repeated headless audits can reuse that prefix;
   # only the bounded runner task and its JSON input vary by generation.
   audit_prompt="${spec_body}"$'\n\n'"${audit_prompt}"
@@ -1201,6 +1242,7 @@ if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
     exit 1
   fi
 elif [[ "$audit_host" != codex ]] && command -v claude >/dev/null 2>&1 && [[ -r "$spec_file" ]]; then
+  audit_route=claude
   audit_started=true
   remove_owned_verdict
   rm -f "$audit_output_file"
@@ -1220,6 +1262,7 @@ elif [[ "$audit_host" != codex ]] && command -v claude >/dev/null 2>&1 && [[ -r 
     exit 1
   fi
 elif [[ "$audit_host" != claude ]] && codex_bin="$(codex_cli_find)" && [[ -r "$spec_file" ]]; then
+  audit_route=codex
   audit_started=true
   remove_owned_verdict
   rm -f "$audit_output_file"
@@ -1241,7 +1284,7 @@ elif [[ "$audit_host" != claude ]] && codex_bin="$(codex_cli_find)" && [[ -r "$s
           --cd "$project_dir" \
           --ephemeral \
           --output-last-message "$audit_output_file" \
-          - >/dev/null 2>&1; then
+          -; then
     rm -f "$audit_output_file"
     remove_owned_verdict while-current
     echo "run-verdict-audit.sh: auditor process group ended without a usable completion" >&2

@@ -3,7 +3,8 @@
 # plain shell. An agent with a built-in (Task, collaboration.spawn_agent) spawns the
 # commit-push-auditor directly and never reaches this script.
 #
-# Default mode is agentic: invoke `codex exec` in read-only, hooks-disabled mode
+# Default mode is agentic: invoke `codex exec` with a private writable scratch root
+# and a read-only repository, with hooks disabled,
 # and write the same .agents/state/last-audit.json contract that the
 # commit-push-auditor subagent writes. Set CODEX_COMMIT_PUSH_AUDIT_MODE=local
 # only for offline tests or explicit diagnostics.
@@ -21,6 +22,10 @@ audit_file="$project_dir/.agents/state/last-audit.json"
 # trap a no-op on paths that never create a dir; the `:-` only guards that init
 # being dropped later.
 audit_tmp_dir=""
+candidate_tree=""
+audit_started_at="$(date +%s)"
+audit_execution_outcome=ERROR
+audit_execution_route=local
 evidence_max_bytes=262144
 agent_output_max_bytes=65536
 # The auditor's RESULT and the auditor's STDERR are bounded separately because they
@@ -74,6 +79,8 @@ if [[ ! -r "$verdict_state_lib" ]]; then
 fi
 # shellcheck source=../../lib/verdict-audit-state.sh
 source "$verdict_state_lib" || exit 2
+# shellcheck source=../../lib/audit-diagnostics.sh
+source "$tooling_root/.agents/lib/audit-diagnostics.sh" || exit 2
 
 audit_timeout_is_numeric=true
 [[ "$audit_timeout_seconds" =~ ^[1-9][0-9]*$ \
@@ -111,7 +118,18 @@ cleanup_runner() {
       original_status=2
     fi
   fi
-  [[ -z "${audit_tmp_dir:-}" ]] || rm -rf "$audit_tmp_dir"
+  if [[ -n "${audit_tmp_dir:-}" ]]; then
+    local outcome=ERROR
+    if (( original_status == 130 || original_status == 143 )); then outcome=CANCELED
+    elif [[ "$audit_execution_outcome" == PASS || "$audit_execution_outcome" == FAIL ]]; then
+      outcome="$audit_execution_outcome"
+    fi
+    audit_diagnostic_record "$project_dir" "${AUDITOR_SESSION_SCOPE:--}" "$kind" \
+      "${auditor_generation:-legacy}" "${history_id:-$$}" "$audit_execution_route" "$audit_started_at" \
+      "${codex_group_exit_status:-null}" "$original_status" "$outcome" \
+      "$audit_tmp_dir/codex-stderr.log" || true
+    rm -rf "$audit_tmp_dir"
+  fi
   [[ -z "${push_context_tmp_dir:-}" ]] || rm -rf "$push_context_tmp_dir"
   exit "$original_status"
 }
@@ -513,6 +531,7 @@ run_local_audit() {
   fi
 
   write_audit "$verdict" "$(findings_json)"
+  audit_execution_outcome="$verdict"
   printf 'local audit %s: %s\n' "$kind" "$verdict"
   if [[ "$verdict" == "FAIL" ]]; then
     printf '%s\n' "${findings[@]}" >&2
@@ -639,6 +658,10 @@ prepare_audit_source() {
       write_fail "Internal: could not create the private audit workspace"
     fi
   fi
+  if [[ "$kind" == commit ]]; then
+    candidate_tree="$(git -C "$repo_root" write-tree)" \
+      || write_fail "Internal: could not capture the staged candidate tree"
+  fi
   if [[ "$kind" == push \
      && "$push_diff_hash_from_command" =~ ^[0-9a-f]{64}$ ]] \
      && ! valid_push_audit_context; then
@@ -728,6 +751,7 @@ audit_source_is_current() {
   case "$kind" in
     commit)
       [[ "$(current_diff_hash)" == "$diff_hash" \
+         && "$(git -C "$repo_root" write-tree)" == "$candidate_tree" \
          && "$(current_commit_subject_hash)" == "$bound_commit_subject_hash" ]]
       ;;
     push)
@@ -753,19 +777,6 @@ build_prompt() {  # evidence file, evidence sha256
     redacted_command='<omitted: target command exceeded 2048 bytes; use the bound hashes and locally checked subject>'
     target_command_truncated=true
   fi
-  command_json="$(jq -nc \
-    --arg target_command "$redacted_command" \
-    --argjson target_command_truncated "$target_command_truncated" \
-    --argjson target_command_bytes "$command_bytes" \
-    --arg operation_kind "$kind" \
-    --arg repo_root "$repo_root" \
-    --arg expected_branch "$branch" \
-    '{target_command:$target_command,
-      target_command_truncated:$target_command_truncated,
-      target_command_bytes:$target_command_bytes,
-      operation_kind:$operation_kind, repo_root:$repo_root,
-      expected_branch:$expected_branch}')"
-
   # Shared Markdown owns the finding/advisory split. A copy drifting would reclassify blocking
   # findings as advisories — a FAIL that becomes a PASS with nothing to notice it. A
   # missing document is therefore a hard failure, not something to improvise around.
@@ -780,6 +791,23 @@ build_prompt() {  # evidence file, evidence sha256
   fi
   # shellcheck source=../../lib/subagent.sh
   source "$subagent_lib"
+  command_json="$(jq -nc \
+    --arg target_command "$redacted_command" \
+    --argjson target_command_truncated "$target_command_truncated" \
+    --argjson target_command_bytes "$command_bytes" \
+    --arg operation_kind "$kind" \
+    --arg repo_root "$repo_root" \
+    --arg index_tree "$candidate_tree" \
+    --arg expected_branch "$branch" \
+    --arg parent_session_id "${AUDITOR_PARENT_SESSION_ID:-${CODEX_THREAD_ID:-}}" \
+    --arg parent_host "${AUDITOR_PARENT_HOST:-$(hook_host_kind)}" \
+    --arg audit_started_at "$audit_started_at" \
+    '{target_command:$target_command,
+      target_command_truncated:$target_command_truncated,
+      target_command_bytes:$target_command_bytes,
+      operation_kind:$operation_kind, repo_root:$repo_root, index_tree:$index_tree,
+      expected_branch:$expected_branch, parent_session_id:$parent_session_id,
+      parent_host:$parent_host, audit_started_at:$audit_started_at}')"
   audit_context="$(build_audit_summary "$evidence_file" "$evidence_hash")" || return 1
   if ! audit_criteria="$(subagent_prompt audit/commit-push-criteria "$tooling_root" "plugin_root=$tooling_root")" \
      || [[ "$audit_criteria" != *[![:space:]]* ]]; then
@@ -903,6 +931,7 @@ normalize_agentic_output() {
     | verdict_audit_write_atomic_identity "$audit_file")" \
     || write_fail "Internal: could not publish Codex audit state safely"
   published_audit_identity="$identity"
+  audit_execution_outcome="$audit_verdict"
   printf 'codex audit %s: %s\n' "$kind" "$audit_verdict"
   if [[ "$audit_verdict" == "FAIL" ]]; then
     printf '%s' "$normalized_output" | jq -r '.findings[]' >&2
@@ -1022,6 +1051,24 @@ run_codex_group() {  # codex-bin prompt raw-output stderr-log
   local command_status status_record="" reason_record=""
   codex_group_reason=""
   codex_group_exit_status=125
+  local workspace="$audit_tmp_dir/workspace" mktemp_bin
+  mktemp_bin="$(type -P mktemp)" || return 125
+  [[ "$mktemp_bin" == /* && -x "$mktemp_bin" ]] || return 125
+  mkdir -m 700 "$workspace" "$workspace/tmp" "$workspace/bin" || return 125
+  # Darwin's implicit mktemp template ignores TMPDIR. Keep default calls in scratch;
+  # explicit templates/options retain the host utility's behavior and sandbox checks.
+  {
+    cat <<'MKTEMP'
+#!/usr/bin/env bash
+implicit=true
+for argument; do
+  case "$argument" in -d|-q|-u|--directory|--quiet|--dry-run) ;; *) implicit=false ;; esac
+done
+if [[ "$implicit" == true ]]; then set -- "$@" "$TMPDIR/tmp.XXXXXXXXXX"; fi
+MKTEMP
+    printf 'exec %q "$@"\n' "$mktemp_bin"
+  } > "$workspace/bin/mktemp" || return 125
+  chmod 700 "$workspace/bin/mktemp" || return 125
   : > "$raw_file" || return 125
   : > "$log_file" || return 125
   chmod 600 "$raw_file" "$log_file" || return 125
@@ -1059,12 +1106,19 @@ run_codex_group() {  # codex-bin prompt raw-output stderr-log
       # entire group instead of one writer disappearing before its descendants.
       trap '' XFSZ 2>/dev/null || true
       export CODEX_AUDIT_HOOK=1
+      export TMPDIR="$workspace/tmp"
       exec "$codex_bin" \
         --ask-for-approval never \
         exec \
+        --ignore-user-config \
         --disable hooks \
-        --sandbox read-only \
-        --cd "$repo_root" \
+        --sandbox workspace-write \
+        -c 'sandbox_workspace_write.writable_roots=[]' \
+        -c 'sandbox_workspace_write.exclude_tmpdir_env_var=true' \
+        -c 'sandbox_workspace_write.exclude_slash_tmp=true' \
+        -c 'sandbox_workspace_write.network_access=true' \
+        --cd "$workspace" \
+        --skip-git-repo-check \
         --ephemeral \
         --output-schema "$schema_file" \
         --output-last-message "$raw_file" \
@@ -1130,6 +1184,9 @@ run_codex_group() {  # codex-bin prompt raw-output stderr-log
 }
 
 run_agentic_audit() {
+  # shellcheck source=../../lib/audit-network.sh
+  source "$tooling_root/.agents/lib/audit-network.sh" || exit 2
+  audit_network_load || exit 2
   # Do cheap local checks before sending sanitized context to an agentic auditor.
   # This keeps obvious secret-like material and marker files local to the machine
   # without writing a consumable PASS artifact.
@@ -1137,6 +1194,7 @@ run_agentic_audit() {
   run_local_checks "$audit_raw_source_file"
   if (( ${#findings[@]} > 0 )); then
     write_audit "FAIL" "$(findings_json)"
+    audit_execution_outcome=FAIL
     printf 'local precheck %s: FAIL\n' "$kind"
     printf '%s\n' "${findings[@]}" >&2
     exit 1
@@ -1228,6 +1286,7 @@ run_agentic_audit() {
   start_auditor_control
 
   local codex_group_rc=0
+  audit_execution_route=codex
   run_codex_group "$codex_bin" "$prompt_text" "$raw_file" "$log_file" \
     || codex_group_rc=$?
   case "$codex_group_reason" in
@@ -1245,7 +1304,7 @@ run_agentic_audit() {
       ;;
   esac
   if (( codex_group_rc != 0 )); then
-    write_fail "Internal: codex exec audit failed to complete"
+    write_fail "Internal: codex exec audit failed with exit ${codex_group_rc} after $(( $(date +%s) - audit_started_at )) seconds; inspect audit-diagnostics in .agents/state"
   fi
 
   if [[ "$(hash_file "$evidence_file" 2>/dev/null || true)" != "$evidence_hash" ]]; then

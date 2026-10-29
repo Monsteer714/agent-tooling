@@ -121,6 +121,8 @@
 #
 # Tests: bash .agents/hooks/audit/preflight-verdict-check.test.sh
 set -uo pipefail
+verdict_gate_started_at="${VERDICT_STOP_STARTED_AT:-}"
+[[ "$verdict_gate_started_at" =~ ^[0-9]{1,10}$ ]] || verdict_gate_started_at="$(date +%s)"
 
 for required_command in jq perl; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
@@ -178,6 +180,8 @@ if [[ ! -r "$audit_state_lib" || ! -r "$override_state_lib" ]]; then
 fi
 # shellcheck source=../../lib/verdict-audit-state.sh
 source "$audit_state_lib"
+# shellcheck source=../../lib/audit-request.sh
+source "$tooling_root/.agents/lib/audit-request.sh" || exit 2
 # shellcheck source=../../lib/audit-reflection.sh
 source "$tooling_root/.agents/lib/audit-reflection.sh"
 # shellcheck source=../../lib/audit-reflection-gate.sh
@@ -275,7 +279,7 @@ prompt_epoch_is_current() {
 log_decision() {  # rung outcome
   local line
   mkdir -p "$(dirname "$decision_log")" 2>/dev/null || return 0
-  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) ${FINAL_ID:--} $1 $2"
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) elapsed_seconds=$(( $(date +%s) - verdict_gate_started_at )) ${FINAL_ID:--} $1 $2"
   verdict_audit_append_log_line "$decision_log" "$line" 2>/dev/null || true
 }
 
@@ -693,11 +697,7 @@ fi
 # content), via a throwaway index. Deterministic and read-only w.r.t. the real
 # index/tree. Keep IDENTICAL to the snippet in boxlite-verdict-audit.
 compute_tree_hash() {
-  local idx; idx="$(mktemp)"
-  GIT_INDEX_FILE="$idx" git -C "$repo_root" read-tree HEAD >/dev/null 2>&1
-  GIT_INDEX_FILE="$idx" git -C "$repo_root" add -A >/dev/null 2>&1
-  GIT_INDEX_FILE="$idx" git -C "$repo_root" write-tree 2>/dev/null
-  rm -f "$idx"
+  audit_request_tree "$repo_root"
 }
 
 # A prompt-scoped user decision is a gate outcome, never an auditor verdict. It is
@@ -938,18 +938,10 @@ is_harness_noise() {  # $1 = stripped turn text
 }
 
 # ── Tier B: assertion-only claims, decidable without the model ───────────────
-# A deliberately SMALL subset of the fallback list below: forms that REPORT an
-# observation rather than name one — a concrete count ("173/173 tests pass"), a
-# whole-line "done.", a line-initial "Verified …". Prose that merely DISCUSSES
-# verdict phrasing ("people write things like tests pass or root cause is X") cannot
-# take these shapes, so promoting them ahead of the classifier does not resurrect the
-# static false positives the classifier exists to remove — which is why the ambiguous
-# majority ("tests pass", "root cause is", "deploy is healthy") stays with the model.
-# "deploy is healthy" is in the ambiguous group on purpose: "once the deploy is
-# healthy, we proceed" is discussion, not a claim.
-# Measured: 60/563 turns (10.7%), zero false blocks across 21 model-labelled hits.
-assertion_patterns='[0-9]+ */ *[0-9]+ +(tests?|checks?|suites?|cases?)? *(pass(ed|ing|es)?|green)'
-assertion_patterns+='|^[[:space:]]*done[.! ]*$'
+# Whole-line completion and line-initial confirmation remain cheap assertions.
+# Numeric results use the classifier regardless of count formatting, so questions
+# and examples receive the same context-sensitive judgment as other verdict prose.
+assertion_patterns='^[[:space:]]*done[.! ]*$'
 assertion_patterns+='|^[[:space:]]*(verified|confirmed)[[:space:]]+[a-z]'
 
 # Triage: ask a small fast model whether the turn draws a conclusion the reader has to
@@ -1205,6 +1197,9 @@ should_audit() {  # stdin-less; uses $1 as the stripped message; echoes YES/NO/U
     echo UNKNOWN
     return 0
   fi
+  # shellcheck source=../../lib/audit-network.sh
+  source "$tooling_root/.agents/lib/audit-network.sh" || { echo UNKNOWN; return; }
+  audit_network_load || { echo UNKNOWN; return; }
   if [[ -z "${VERDICT_CLASSIFIER_CMD:-}" ]]; then
     audit_host="$(hook_host_kind)" || { echo UNKNOWN; return 0; }
   fi
@@ -1269,6 +1264,7 @@ should_audit() {  # stdin-less; uses $1 as the stripped message; echoes YES/NO/U
 verdict_patterns='root cause (is|was|confirmed|:)'
 verdict_patterns+='|(all |the )?(tests?|suites?|checks?|builds?) (now |all |still )?(pass(es|ed|ing)?|green)'
 verdict_patterns+='|[0-9]+/[0-9]+ (tests? )?(pass|passing|green)'
+verdict_patterns+='|[0-9]+[[:space:]]+(tests?[[:space:]]+)?passed([,.;[:space:]]|$)'
 verdict_patterns+='|no (issues|bugs|problems|errors|regressions)'
 verdict_patterns+='|(is|are|looks?) (now )?(fixed|resolved|working|correct|healthy|stable|live|green|complete|done|verified)'
 verdict_patterns+='|works (as expected|correctly|now|fine|end.to.end)'
@@ -1301,7 +1297,7 @@ load_verdict_request() {
     request_is_current=true
     return 0
   fi
-  local body generation deadline message_id extra now allow_canceled="${1:-false}"
+  local body generation deadline message_id extra now allow_canceled="${1:-false}" context
   [[ -r "$verdict_request_file" ]] || return 1
   body="$(verdict_audit_read_single_record "$verdict_request_file" 2>/dev/null)" || return 1
   read -r generation deadline message_id extra <<< "$body"
@@ -1312,6 +1308,14 @@ load_verdict_request() {
      && -z "$extra" \
      && "$message_id" == "$FINAL_ID" ]] || return 1
   (( now <= deadline && deadline <= now + audit_lock_max_seconds )) || return 1
+  # Only legacy callers without a prompt epoch may omit context. Losing retained
+  # metadata must never let identical text consume an earlier turn's result.
+  if [[ "$entry_prompt_epoch" != - \
+     || -e "$state_dir/verdict-request-context.json.$session_scope" \
+     || -L "$state_dir/verdict-request-context.json.$session_scope" ]]; then
+    context="$(audit_request_context_read "$repo_root" "$session_scope" identity 2>/dev/null)" || return 1
+    [[ "$(jq -r .origin_epoch <<< "$context")" == "$entry_prompt_epoch" ]] || return 1
+  fi
   audit_generation="$generation"
   audit_cancellation_file="$(verdict_audit_cancellation_path \
     "$state_dir" "$session_scope" "$audit_generation")"
@@ -1338,6 +1342,7 @@ consume_current_verdict_request() {
     prompt_epoch_is_current || return 1
     verdict_audit_remove_record_if_matches \
       "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || return 1
+    audit_request_context_remove "$repo_root" "$session_scope" "$verdict_request_body" || return 1
   fi
   prompt_epoch_is_current
 }
@@ -1491,6 +1496,7 @@ ensure_verdict_request() {
     return 1
   fi
   [[ "$session_scope" != "-" && -n "$FINAL_ID" ]] || return 0
+  park_retained_dossier || true
   local deadline new_request_body existing_request_body invalid_identity
   audit_generation="$$-$(date +%s)-${RANDOM:-0}"
   auditor_verdict_file="${stable_verdict_file}.audit-${audit_generation}"
@@ -1532,6 +1538,10 @@ ensure_verdict_request() {
     return 1
   fi
   verdict_request_body="$new_request_body"
+  if ! audit_request_context_write "$repo_root" "$session_scope" "$new_request_body" "$entry_prompt_epoch"; then
+    verdict_audit_remove_record_if_matches "$verdict_request_file" "$new_request_body" >/dev/null 2>&1 || true
+    return 1
+  fi
   if ! prompt_epoch_is_current; then
     verdict_audit_remove_record_if_matches \
       "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || true
@@ -1539,6 +1549,28 @@ ensure_verdict_request() {
     return 1
   fi
   request_is_current=true
+}
+
+park_retained_dossier() {
+  local context identity snapshot document request generation linked age
+  context="$(audit_request_context_read "$repo_root" "$session_scope" 2>/dev/null)" || return 1
+  [[ "$(jq -r .origin_epoch <<< "$context")" != "$entry_prompt_epoch" ]] || return 1
+  identity="$(verdict_audit_path_identity "$stable_verdict_file" 2>/dev/null)" || return 1
+  snapshot="$(verdict_audit_read_regular_state "$stable_verdict_file" 65536 json "$identity" 2>/dev/null)" || return 1
+  age="$(( $(date +%s) - ${snapshot%%$'\n'*} ))"
+  (( age >= 0 && age <= max_age_seconds )) || return 1
+  document="$(printf '%s' "${snapshot#*$'\n'}" | verdict_audit_normalize_dossier)" || return 1
+  request="$(jq -r .request <<< "$context")"; generation="${request%% *}"
+  jq -e --argjson context "$context" --arg generation "$generation" '
+    (.verdict == "PASS" or .verdict == "FAIL") and .generation == $generation and
+    .branch == $context.branch and .head == $context.head and .tree_hash == $context.tree_hash
+  ' <<< "$document" >/dev/null || return 1
+  prompt_epoch_is_current || return 1
+  linked="$(verdict_audit_link_no_clobber_identity "$stable_verdict_file" "$prev_verdict_file")" || return 1
+  if [[ "$linked" != "$identity" ]]; then
+    verdict_audit_unlink_if_identity "$prev_verdict_file" "$linked" || true
+    return 1
+  fi
 }
 
 write_payload_transcript() {
@@ -1733,7 +1765,7 @@ block_audit_infrastructure_failure() {  # reason
 audit_before_stop() {  # trigger-reason
   local trigger_reason="$1"
   local runner="$tooling_root/.agents/hooks/audit/run-verdict-audit.sh"
-  local runner_status=0 runner_failure=""
+  local runner_status=0 runner_failure="" runner_error=""
   # The runner records this bounded summary in history; the auditor finds evidence.
   require_audit_reflection
   if ! ensure_verdict_request; then
@@ -1747,11 +1779,12 @@ Verdict audit could not start because its generation-bound request was not recor
 
 Verdict audit runner is unavailable at ${runner}."
   fi
-  CLAUDE_PROJECT_DIR="$project_dir" bash "$runner" "${transcript_path:--}" \
-    "$session_id" "$audit_generation" "$session_scope" >/dev/null 2>&1 \
+  runner_error="$(CLAUDE_PROJECT_DIR="$project_dir" bash "$runner" "${transcript_path:--}" \
+    "$session_id" "$audit_generation" "$session_scope" 2>&1 >/dev/null)" \
     || runner_status=$?
   prompt_epoch_is_current || allow
   if (( runner_status != 0 )); then
+    log_decision runner ERROR-block
     case "$runner_status" in
       1) runner_failure="the independent auditor did not produce a valid dossier" ;;
       2) runner_failure="the auditor could not launch or its history needs recovery" ;;
@@ -1761,7 +1794,8 @@ Verdict audit runner is unavailable at ${runner}."
     require_audit_reflection
     block_audit_infrastructure_failure "${trigger_reason}
 
-Verdict audit could not complete: ${runner_failure}. Retry after restoring the auditor."
+Verdict audit could not complete: ${runner_failure}.
+${runner_error:0:2048}"
   fi
 
   # Re-enter the hardened dossier path instead of duplicating its generation, binding,
@@ -1771,6 +1805,7 @@ Verdict audit could not complete: ${runner_failure}. Retry after restoring the a
     | ( cd "$repo_root" \
         && CLAUDE_PROJECT_DIR="$project_dir" \
           VERDICT_STOP_REENTRY_INCOMPLETE="$transcript_snapshot_truncated" \
+          VERDICT_STOP_STARTED_AT="$verdict_gate_started_at" \
           VERDICT_STOP_REENTRY_EPOCH="$entry_prompt_epoch" bash "${BASH_SOURCE[0]}" )
   exit $?
 }
